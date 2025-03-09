@@ -1,16 +1,15 @@
-
-
-
-
 import base64
 from datetime import datetime
 import json
 from pathlib import Path
 import shutil
 from typing import Any, Dict, Optional, Union
-from key_manager import CryptoError, DecryptionError, KeyManager
+
 from cryptography.fernet import Fernet
 from cryptography.fernet import InvalidToken
+
+from key_manager import CryptoError, DecryptionError, KeyManager
+from models import EncryptedPackage, FileMetadata, KeyInfo, DecryptedFileInfo
 
 
 class Encryptor:
@@ -24,7 +23,7 @@ class Encryptor:
         """
         self.key_manager = key_manager
         
-    def encrypt_data(self, data: Union[str, bytes], key_id: Optional[str] = None) -> Dict[str, str]:
+    def encrypt_data(self, data: Union[str, bytes], key_id: Optional[str] = None) -> EncryptedPackage:
         """Encrypts data with Fernet (AES-256) 
         
         Args:
@@ -32,7 +31,7 @@ class Encryptor:
             key_id: Optional key ID to use for encryption (generates a new key if not provided).
             
         Returns:
-            A dictionary containing the encrypted data and metadata.
+            An EncryptedPackage containing the encrypted data and metadata.
         """
         if key_id is None:
             key_id = self.key_manager.generate_key()
@@ -43,22 +42,21 @@ class Encryptor:
         if isinstance(data, str):
             data = data.encode('utf-8')
         encrypted_data = f.encrypt(data)
-        timestamp = datetime.now().isoformat()
         
-        result = {
-            'data': base64.b64encode(encrypted_data).decode('utf-8'),
-            'key_id': key_id,
-            'timestamp': timestamp,
-            'version': '1.0'
-        }
+        result = EncryptedPackage(
+            data=base64.b64encode(encrypted_data).decode('utf-8'),
+            key_id=key_id,
+            timestamp=datetime.now(),
+            version='1.0'
+        )
         
         return result
     
-    def decrypt_data(self, encrypted_package: Dict[str, str]) -> bytes:
+    def decrypt_data(self, encrypted_package: EncryptedPackage) -> bytes:
         """Decrypts data with Fernet (AES-256).
         
         Args:
-            encrypted_package: A dictionary containing the encrypted data and metadata.
+            encrypted_package: An EncryptedPackage containing the encrypted data and metadata.
             
         Returns:
             The decrypted data.
@@ -67,8 +65,8 @@ class Encryptor:
             DecryptionError: If the data cannot be decrypted.
         """
         try:
-            key_id = encrypted_package['key_id']
-            encrypted_data = base64.b64decode(encrypted_package['data'])
+            key_id = encrypted_package.key_id
+            encrypted_data = base64.b64decode(encrypted_package.data)
             key = self.key_manager.get_key(key_id)
             f = Fernet(key)
             return f.decrypt(encrypted_data)
@@ -76,7 +74,7 @@ class Encryptor:
             raise DecryptionError(f"Failed to decrypt data: {e}")
         
     def encrypt_file(self, input_path: str, output_path: Optional[str] = None, password: Optional[str] = None,
-                     key_id: Optional[str] = None, chunk_size: int = 4096, encrypt_filename: bool = False) -> Dict[str, Any]:
+                     key_id: Optional[str] = None, chunk_size: int = 4096, encrypt_filename: bool = False) -> FileMetadata:
         """
         Encrypts a file with Fernet (AES-256).
         
@@ -89,7 +87,7 @@ class Encryptor:
             encrypt_filename: Whether to encrypt the filename in the metadata.
             
         Returns:
-            A dictionary containing the metadata of the encrypted file.
+            FileMetadata containing the metadata of the encrypted file.
             
         Raises:
             IOError: If the input file cannot be read or the output file cannot be written.
@@ -105,31 +103,36 @@ class Encryptor:
         if password is not None:
             key, salt = self.key_manager.derive_key_from_password(password)
             f = Fernet(key)
-            key_info = {'type': 'password', 'salt': base64.b64encode(salt).decode()}
+            key_info = KeyInfo(
+                type='password',
+                salt=base64.b64encode(salt).decode()
+            )
         else:
             if key_id is None:
                 key_id = self.key_manager.generate_key()
             key = self.key_manager.get_key(key_id)
             f = Fernet(key)
-            key_info = {'type': 'key_id', 'key_id': key_id}
+            key_info = KeyInfo(
+                type='key_id',
+                key_id=key_id
+            )
             
         filename = _input_path.name
         file_size = _input_path.stat().st_size
-        timestamp = datetime.now().isoformat()
         
         if encrypt_filename:
             filename = base64.b64encode(f.encrypt(filename.encode())).decode()  
             
-        metadata = {
-            'key_info': key_info,
-            'original_filename': filename,
-            'original_size': file_size,
-            'encrypted': True,
-            'timestamp': timestamp,
-            'encrypt_filename': encrypt_filename,
-            'version': '1.0',
-            'hmac': None  # Will be filled in later
-        }
+        metadata = FileMetadata(
+            key_info=key_info,
+            original_filename=filename,
+            original_size=file_size,
+            encrypted=True,
+            timestamp=datetime.now(),
+            encrypt_filename=encrypt_filename,
+            version='1.0',
+            hmac=None  # Will be filled in later
+        )
         
         temp_output_path = None  # Initialize before the try block
         try:
@@ -144,7 +147,7 @@ class Encryptor:
                     
             metadata_path = _output_path.with_suffix('.meta')
             with open(metadata_path, 'w') as meta_file:
-                json.dump(metadata, meta_file)
+                json.dump(metadata.dict(), meta_file)
                 
             shutil.move(temp_output_path, _output_path)
             return metadata
@@ -159,7 +162,7 @@ class Encryptor:
             raise CryptoError(f"Failed to encrypt file: {e}")
         
     def decrypt_file(self, input_path: str, output_path: Optional[str] = None, 
-                     password: Optional[str] = None, chunk_size: int = 4096) -> Dict[str, Any]:
+                     password: Optional[str] = None, chunk_size: int = 4096) -> DecryptedFileInfo:
         """
         Decrypts a file that was encrypted with encrypt_file().
         
@@ -170,7 +173,7 @@ class Encryptor:
             chunk_size: The size of each chunk read from the input file.
             
         Returns:
-            A dictionary containing the metadata of the decrypted file.
+            DecryptedFileInfo containing information about the decrypted file.
             
         Raises:
             DecryptionError: If the file cannot be decrypted.
@@ -181,21 +184,26 @@ class Encryptor:
         
         try:
             with open(metadata_path, 'r') as meta_file:
-                metadata: dict = json.load(meta_file)
+                metadata_dict = json.load(meta_file)
+                metadata = FileMetadata.parse_obj(metadata_dict)
         except (IOError, json.JSONDecodeError) as e:
             raise IOError(f"Failed to read metadata: {e}")
         
         if output_path is None:
-            file_name = metadata['original_filename']
-            if metadata.get('encrypt_filename', False):
-                if metadata['key_info']['type'] == 'password':
+            file_name = metadata.original_filename
+            if metadata.encrypt_filename:
+                if metadata.key_info.type == 'password':
                     if password is None:
                         raise DecryptionError("Password required to decrypt file")
-                    salt = base64.b64decode(metadata['key_info']['salt'])
+                    if metadata.key_info.salt is None:
+                        raise DecryptionError("Salt required for password-based keys")
+                    salt = base64.b64decode(metadata.key_info.salt)
                     key, _ = self.key_manager.derive_key_from_password(password, salt)
                     f = Fernet(key)
                 else:
-                    key_id = metadata['key_info']['key_id']
+                    key_id = metadata.key_info.key_id
+                    if key_id is None:
+                        raise DecryptionError("Key ID required for key-based encryption")
                     key = self.key_manager.get_key(key_id)
                     f = Fernet(key)
                     
@@ -206,14 +214,18 @@ class Encryptor:
         else:
             _output_path = Path(output_path)
             
-        if metadata['key_info']['type'] == 'password':
+        if metadata.key_info.type == 'password':
             if password is None:
                 raise DecryptionError("Password required to decrypt file")
-            salt = base64.b64decode(metadata['key_info']['salt'])
+            if metadata.key_info.salt is None:
+                raise DecryptionError("Salt required for password-based keys")
+            salt = base64.b64decode(metadata.key_info.salt)
             key, _ = self.key_manager.derive_key_from_password(password, salt)
             f = Fernet(key)
         else:
-            key_id = metadata['key_info']['key_id']
+            key_id = metadata.key_info.key_id
+            if key_id is None:
+                raise DecryptionError("Key ID required for key-based encryption")
             try:
                 key = self.key_manager.get_key(key_id)
                 f = Fernet(key)
@@ -235,19 +247,19 @@ class Encryptor:
                         raise DecryptionError(f"Failed to decrypt file: {e}")
             
             shutil.move(temp_output, _output_path)
-            return {
-                'original_filename': metadata['original_filename'],
-                'original_size': metadata['original_size'],
-                'decrypted_path': str(output_path),
-                'timestamp': datetime.now().isoformat()
-            }
+            return DecryptedFileInfo(
+                original_filename=metadata.original_filename,
+                original_size=metadata.original_size,
+                decrypted_path=str(_output_path),
+                timestamp=datetime.now()
+            )
             
         except (IOError, OSError) as e:
             if temp_output.exists():
                 temp_output.unlink()    
             raise IOError(f"Failed to decrypt file: {e}")
-        
 
-            
-                
-                
+
+
+
+
