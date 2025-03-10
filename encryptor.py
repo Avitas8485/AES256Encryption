@@ -258,6 +258,244 @@ class Encryptor:
             if temp_output.exists():
                 temp_output.unlink()    
             raise IOError(f"Failed to decrypt file: {e}")
+    
+    def encrypt_db_field(self, value: Any, key_id: Optional[str] = None) -> str:
+        """
+        Encrypts a database field value.
+        
+        Args:
+            value: The value to encrypt.
+            key_id: Optional key ID to use for encryption (generates a new key if not provided).
+            
+        Returns:
+            Base64 encoded string with encrypted data.
+            
+        Raises:
+            CryptoError: If the value cannot be encrypted.
+        """
+        try:
+            # Convert value to string if it's not already
+            if not isinstance(value, (str, bytes)):
+                value = str(value)
+                
+            # Encrypt the data
+            encrypted_package = self.encrypt_data(value, key_id)
+            
+            # Return a packed string with key_id and encrypted data
+            return json.dumps({
+                "key_id": encrypted_package.key_id,
+                "data": encrypted_package.data,
+                "version": encrypted_package.version
+            })
+        except Exception as e:
+            raise CryptoError(f"Failed to encrypt field value: {e}")
+    
+    def decrypt_db_field(self, encrypted_value: str) -> str:
+        """
+        Decrypts a database field value.
+        
+        Args:
+            encrypted_value: The encrypted value, as returned by encrypt_db_field.
+            
+        Returns:
+            The decrypted value as a string.
+            
+        Raises:
+            DecryptionError: If the value cannot be decrypted.
+        """
+        try:
+            # Parse the encrypted value
+            encrypted_data = json.loads(encrypted_value)
+            
+            # Create an EncryptedPackage
+            package = EncryptedPackage(
+                data=encrypted_data["data"],
+                key_id=encrypted_data["key_id"],
+                timestamp=datetime.now(),
+                version=encrypted_data.get("version", "1.0")
+            )
+            
+            # Decrypt the data
+            decrypted_data = self.decrypt_data(package)
+            
+            # Return the decrypted data as a string
+            return decrypted_data.decode('utf-8')
+        except json.JSONDecodeError:
+            raise DecryptionError("Invalid encrypted field format")
+        except Exception as e:
+            raise DecryptionError(f"Failed to decrypt field value: {e}")
+            
+    def sqlite_encrypt_db(self, db_path: str, tables_fields_config: Dict[str, list], 
+                          key_id: Optional[str] = None, backup: bool = True) -> Dict[str, int]:
+        """
+        Encrypts specified fields in a SQLite database.
+        
+        Args:
+            db_path: Path to the SQLite database file
+            tables_fields_config: Dict mapping table names to lists of field names to encrypt
+            key_id: Optional key ID to use for encryption
+            backup: Whether to create a backup of the database before modifying
+            
+        Returns:
+            Dict with statistics about encrypted fields
+            
+        Raises:
+            CryptoError: If the database fields cannot be encrypted
+        """
+        import sqlite3
+        try:
+            
+            
+            _db_path = Path(db_path)
+            
+            # Create backup if requested
+            if backup:
+                backup_path = f"{db_path}.bak"
+                shutil.copy2(db_path, backup_path)
+            
+            stats = {"fields_encrypted": 0}
+            
+            # Connect to the database
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Process each table and its fields
+            for table, fields in tables_fields_config.items():
+                # Get all rows from the table
+                cursor.execute(f"SELECT * FROM {table}")
+                rows = cursor.fetchall()
+                
+                # Get column names
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns_info = cursor.fetchall()
+                column_names = [col[1] for col in columns_info]
+                
+                # Check if all specified fields exist
+                for field in fields:
+                    if field not in column_names:
+                        raise CryptoError(f"Field {field} not found in table {table}")
+                
+                # Process each row
+                for row in rows:
+                    row_dict = dict(zip(column_names, row))
+                    row_id = row_dict.get('id', row_dict.get('ID', row_dict.get('Id')))
+                    
+                    if not row_id:
+                        continue  # Skip rows without ID
+                    
+                    # Build update query
+                    updates = []
+                    params = []
+                    
+                    for field in fields:
+                        if row_dict[field] is not None:
+                            updates.append(f"{field} = ?")
+                            encrypted_value = self.encrypt_db_field(row_dict[field], key_id)
+                            params.append(encrypted_value)
+                            stats["fields_encrypted"] += 1
+                    
+                    if updates:
+                        update_query = f"UPDATE {table} SET {', '.join(updates)} WHERE id = ?"
+                        params.append(row_id)
+                        cursor.execute(update_query, params)
+            
+            # Commit changes
+            conn.commit()
+            conn.close()
+            
+            return stats
+        
+        except sqlite3.Error as e:
+            raise CryptoError(f"SQLite error during encryption: {e}")
+        except Exception as e:
+            raise CryptoError(f"Failed to encrypt database fields: {e}")
+    
+    def sqlite_decrypt_db(self, db_path: str, tables_fields_config: Dict[str, list], 
+                          backup: bool = True) -> Dict[str, int]:
+        """
+        Decrypts specified fields in a SQLite database.
+        
+        Args:
+            db_path: Path to the SQLite database file
+            tables_fields_config: Dict mapping table names to lists of field names to decrypt
+            backup: Whether to create a backup of the database before modifying
+            
+        Returns:
+            Dict with statistics about decrypted fields
+            
+        Raises:
+            DecryptionError: If the database fields cannot be decrypted
+        """
+        import sqlite3
+        try:
+            
+            _db_path = Path(db_path)
+            
+            # Create backup if requested
+            if backup:
+                backup_path = f"{db_path}.bak"
+                shutil.copy2(db_path, backup_path)
+            
+            stats = {"fields_decrypted": 0}
+            
+            # Connect to the database
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Process each table and its fields
+            for table, fields in tables_fields_config.items():
+                # Get all rows from the table
+                cursor.execute(f"SELECT * FROM {table}")
+                rows = cursor.fetchall()
+                
+                # Get column names
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns_info = cursor.fetchall()
+                column_names = [col[1] for col in columns_info]
+                
+                # Check if all specified fields exist
+                for field in fields:
+                    if field not in column_names:
+                        raise DecryptionError(f"Field {field} not found in table {table}")
+                
+                # Process each row
+                for row in rows:
+                    row_dict = dict(zip(column_names, row))
+                    row_id = row_dict.get('id', row_dict.get('ID', row_dict.get('Id')))
+                    
+                    if not row_id:
+                        continue  # Skip rows without ID
+                    
+                    # Build update query
+                    updates = []
+                    params = []
+                    
+                    for field in fields:
+                        if row_dict[field] is not None:
+                            try:
+                                updates.append(f"{field} = ?")
+                                decrypted_value = self.decrypt_db_field(row_dict[field])
+                                params.append(decrypted_value)
+                                stats["fields_decrypted"] += 1
+                            except DecryptionError:
+                                # Skip fields that aren't actually encrypted
+                                continue
+                    
+                    if updates:
+                        update_query = f"UPDATE {table} SET {', '.join(updates)} WHERE id = ?"
+                        params.append(row_id)
+                        cursor.execute(update_query, params)
+            
+            # Commit changes
+            conn.commit()
+            conn.close()
+            
+            return stats
+        
+        except sqlite3.Error as e:
+            raise DecryptionError(f"SQLite error during decryption: {e}")
+        except Exception as e:
+            raise DecryptionError(f"Failed to decrypt database fields: {e}")
 
 
 
